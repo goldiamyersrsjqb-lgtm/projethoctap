@@ -201,6 +201,9 @@ jobs:
         
         TARGET_IP="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
         TARGET_PORT="${{ github.event.inputs.target_port || '443' }}"
+        if [ -z "$TARGET_PORT" ] || [ "$TARGET_PORT" = "None" ] || [ "$TARGET_PORT" = "null" ]; then
+          TARGET_PORT="443"
+        fi
         RATE="${{ github.event.inputs.rate || '1000' }}"
         DURATION="${{ github.event.inputs.duration || '5' }}"
         METHOD="${{ github.event.inputs.method || 'v18_tcp' }}"
