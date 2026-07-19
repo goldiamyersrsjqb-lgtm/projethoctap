@@ -185,7 +185,10 @@ jobs:
         sudo sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
         sudo iptables -t raw -A OUTPUT -p tcp -j NOTRACK 2>/dev/null || true
         sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
-        sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
+        TARGET_IP_INPUT="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
+        if echo "$TARGET_IP_INPUT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+          sudo iptables -A OUTPUT -p tcp --tcp-flags RST RST -d "$TARGET_IP_INPUT" -j DROP 2>/dev/null || true
+        fi
 
     - name: Start worker (Replica ${{ matrix.id }})
       run: |
@@ -264,4 +267,7 @@ jobs:
     - name: Cleanup
       if: always()
       run: |
-        sudo iptables -D OUTPUT -p tcp --tcp-flags RST RST -d ${{ github.event.inputs.target_ip }} -j DROP 2>/dev/null || true
+        TARGET_IP_INPUT="${{ github.event.inputs.target_ip || '127.0.0.1' }}"
+        if echo "$TARGET_IP_INPUT" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+          sudo iptables -D OUTPUT -p tcp --tcp-flags RST RST -d "$TARGET_IP_INPUT" -j DROP 2>/dev/null || true
+        fi
