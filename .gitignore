@@ -1,0 +1,10 @@
+*.o
+*.so
+*.a
+build/
+.env
+*.tmp
+*.pyc
+.DS_Store
+.idea/
+node_modules/
